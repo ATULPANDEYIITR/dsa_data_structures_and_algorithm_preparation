@@ -1,1432 +1,1224 @@
-/*
- * Web Architecture and REST APIs
- * Industry-style case study: Product Catalog REST Service
- *
- * C++17
- *
- * The program models a resource-oriented HTTP API without requiring an
- * external HTTP framework. It demonstrates the architectural concepts
- * behind REST while keeping storage and transport self-contained.
- */
-
-#include <algorithm>
-#include <chrono>
-#include <cctype>
-#include <cmath>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <regex>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-
-using namespace std;
-
-// =============================================================================
-// Utility functions
-// =============================================================================
-
-string jsonEscape(const string& input) {
-    string output;
-
-    for (char character : input) {
-        switch (character) {
-            case '"':
-                output += "\\\"";
-                break;
-            case '\\':
-                output += "\\\\";
-                break;
-            case '\n':
-                output += "\\n";
-                break;
-            case '\r':
-                output += "\\r";
-                break;
-            case '\t':
-                output += "\\t";
-                break;
-            default:
-                output += character;
-        }
-    }
-
-    return output;
-}
-
-string trim(const string& value) {
-    const auto first = value.find_first_not_of(" \t\n\r");
-
-    if (first == string::npos) {
-        return "";
-    }
-
-    const auto last = value.find_last_not_of(" \t\n\r");
-    return value.substr(first, last - first + 1);
-}
-
-void section(const string& title) {
-    cout << "\n" << string(78, '=') << "\n";
-    cout << title << "\n";
-    cout << string(78, '=') << "\n";
-}
-
-// =============================================================================
-// HTTP method model
-// =============================================================================
-
-enum class HttpMethod {
-    GET,
-    POST,
-    PUT,
-    PATCH,
-    DELETE_METHOD,
-    HEAD,
-    OPTIONS
-};
-
-string methodToString(HttpMethod method) {
-    switch (method) {
-        case HttpMethod::GET:
-            return "GET";
-        case HttpMethod::POST:
-            return "POST";
-        case HttpMethod::PUT:
-            return "PUT";
-        case HttpMethod::PATCH:
-            return "PATCH";
-        case HttpMethod::DELETE_METHOD:
-            return "DELETE";
-        case HttpMethod::HEAD:
-            return "HEAD";
-        case HttpMethod::OPTIONS:
-            return "OPTIONS";
-    }
-
-    return "UNKNOWN";
-}
-
-// =============================================================================
-// Resource
-// =============================================================================
-
-struct Product {
-    int id{};
-    string name;
-    string category;
-    double price{};
-    int stock{};
-    bool active{true};
-    string createdAt;
-
-    string toJson() const {
-        ostringstream output;
-
-        output << fixed << setprecision(2);
-
-        output << "{"
-               << "\"id\":" << id << ","
-               << "\"name\":\"" << jsonEscape(name) << "\","
-               << "\"category\":\"" << jsonEscape(category) << "\","
-               << "\"price\":" << price << ","
-               << "\"stock\":" << stock << ","
-               << "\"active\":" << (active ? "true" : "false") << ","
-               << "\"created_at\":\"" << jsonEscape(createdAt) << "\""
-               << "}";
-
-        return output.str();
-    }
-};
-
-// =============================================================================
-// HTTP request and response
-// =============================================================================
-
-struct HttpRequest {
-    HttpMethod method;
-    string path;
-    map<string, string> headers;
-    map<string, string> query;
-    map<string, string> body;
-};
-
-struct HttpResponse {
-    int statusCode{};
-    map<string, string> headers;
-    string body;
-
-    void print() const {
-        cout << "HTTP Status: " << statusCode << "\n";
-
-        if (!headers.empty()) {
-            cout << "Headers:\n";
-
-            for (const auto& [name, value] : headers) {
-                cout << "  " << name << ": " << value << "\n";
-            }
-        }
-
-        if (!body.empty()) {
-            cout << "Body:\n";
-            cout << body << "\n";
-        }
-    }
-};
-
-// =============================================================================
-// Validation
-// =============================================================================
-
-class ValidationException : public runtime_error {
-public:
-    explicit ValidationException(const string& message)
-        : runtime_error(message) {}
-};
-
-double parseNonNegativeDouble(const map<string, string>& body,
-                              const string& field) {
-    const auto iterator = body.find(field);
-
-    if (iterator == body.end()) {
-        throw ValidationException(field + " is required");
-    }
-
-    try {
-        size_t processed = 0;
-        const double value = stod(iterator->second, &processed);
-
-        if (processed != iterator->second.size()) {
-            throw ValidationException(field + " must be numeric");
-        }
-
-        if (!isfinite(value) || value < 0) {
-            throw ValidationException(
-                field + " must be finite and non-negative"
-            );
-        }
-
-        return value;
-    } catch (const invalid_argument&) {
-        throw ValidationException(field + " must be numeric");
-    } catch (const out_of_range&) {
-        throw ValidationException(field + " is out of range");
-    }
-}
-
-int parseNonNegativeInt(const map<string, string>& body,
-                        const string& field) {
-    const auto iterator = body.find(field);
-
-    if (iterator == body.end()) {
-        throw ValidationException(field + " is required");
-    }
-
-    try {
-        size_t processed = 0;
-        const long value = stol(iterator->second, &processed);
-
-        if (processed != iterator->second.size()) {
-            throw ValidationException(field + " must be an integer");
-        }
-
-        if (value < 0 || value > numeric_limits<int>::max()) {
-            throw ValidationException(
-                field + " must be a valid non-negative integer"
-            );
-        }
-
-        return static_cast<int>(value);
-    } catch (const invalid_argument&) {
-        throw ValidationException(field + " must be an integer");
-    } catch (const out_of_range&) {
-        throw ValidationException(field + " is out of range");
-    }
-}
-
-// =============================================================================
-// Repository
-// =============================================================================
-
-class ProductRepository {
-private:
-    map<int, Product> products;
-    int nextId{1};
-
-    static string currentTimestamp() {
-        using namespace chrono;
-
-        const auto now = system_clock::now();
-        const time_t timeValue = system_clock::to_time_t(now);
-
-        tm utcTime{};
-
-#if defined(_WIN32)
-        gmtime_s(&utcTime, &timeValue);
-#else
-        gmtime_r(&timeValue, &utcTime);
-#endif
-
-        ostringstream output;
-        output << put_time(&utcTime, "%Y-%m-%dT%H:%M:%SZ");
-
-        return output.str();
-    }
-
-public:
-    Product create(const string& name,
-                   const string& category,
-                   double price,
-                   int stock) {
-        Product product{
-            nextId,
-            name,
-            category,
-            price,
-            stock,
-            true,
-            currentTimestamp()
-        };
-
-        products[nextId] = product;
-        ++nextId;
-
-        return product;
-    }
-
-    optional<Product> get(int id) const {
-        const auto iterator = products.find(id);
-
-        if (iterator == products.end()) {
-            return nullopt;
-        }
-
-        return iterator->second;
-    }
-
-    vector<Product> list() const {
-        vector<Product> result;
-
-        for (const auto& [id, product] : products) {
-            result.push_back(product);
-        }
-
-        return result;
-    }
-
-    bool erase(int id) {
-        return products.erase(id) > 0;
-    }
-
-    bool patch(int id,
-               const optional<string>& name,
-               const optional<string>& category,
-               const optional<double>& price,
-               const optional<int>& stock,
-               const optional<bool>& active) {
-        auto iterator = products.find(id);
-
-        if (iterator == products.end()) {
-            return false;
-        }
-
-        if (name.has_value()) {
-            iterator->second.name = *name;
-        }
-
-        if (category.has_value()) {
-            iterator->second.category = *category;
-        }
-
-        if (price.has_value()) {
-            iterator->second.price = *price;
-        }
-
-        if (stock.has_value()) {
-            iterator->second.stock = *stock;
-        }
-
-        if (active.has_value()) {
-            iterator->second.active = *active;
-        }
-
-        return true;
-    }
-};
-
-// =============================================================================
-// Product API
-// =============================================================================
-
-class ProductApi {
-private:
-    ProductRepository repository;
-
-    static bool matchesCategory(const Product& product,
-                                 const string& category) {
-        string left = product.category;
-        string right = category;
-
-        transform(
-            left.begin(),
-            left.end(),
-            left.begin(),
-            [](unsigned char character) {
-                return static_cast<char>(tolower(character));
-            }
-        );
-
-        transform(
-            right.begin(),
-            right.end(),
-            right.begin(),
-            [](unsigned char character) {
-                return static_cast<char>(tolower(character));
-            }
-        );
-
-        return left == right;
-    }
-
-    static HttpResponse errorResponse(
-        int status,
-        const string& code,
-        const string& message) {
-        HttpResponse response;
-        response.statusCode = status;
-        response.headers["Content-Type"] = "application/json";
-
-        response.body =
-            "{"
-            "\"error\":{"
-            "\"code\":\"" + jsonEscape(code) + "\","
-            "\"message\":\"" + jsonEscape(message) + "\""
-            "}"
-            "}";
-
-        return response;
-    }
-
-public:
-    HttpResponse createProduct(const HttpRequest& request) {
-        try {
-            const auto nameIterator = request.body.find("name");
-
-            if (nameIterator == request.body.end()) {
-                throw ValidationException("name is required");
-            }
-
-            const string name = trim(nameIterator->second);
-
-            if (name.empty()) {
-                throw ValidationException(
-                    "name must not be empty"
-                );
-            }
-
-            const auto categoryIterator =
-                request.body.find("category");
-
-            const string category =
-                categoryIterator == request.body.end()
-                    ? "uncategorized"
-                    : trim(categoryIterator->second);
-
-            const double price =
-                parseNonNegativeDouble(request.body, "price");
-
-            const int stock =
-                parseNonNegativeInt(request.body, "stock");
-
-            Product product =
-                repository.create(
-                    name,
-                    category,
-                    price,
-                    stock
-                );
-
-            HttpResponse response;
-            response.statusCode = 201;
-            response.headers["Content-Type"] =
-                "application/json";
-            response.headers["Location"] =
-                "/api/v1/products/" + to_string(product.id);
-            response.body =
-                "{\"data\":" + product.toJson() + "}";
-
-            return response;
-        } catch (const ValidationException& exception) {
-            return errorResponse(
-                422,
-                "VALIDATION_ERROR",
-                exception.what()
-            );
-        }
-    }
-
-    HttpResponse getProduct(int id) const {
-        const auto product = repository.get(id);
-
-        if (!product.has_value()) {
-            return errorResponse(
-                404,
-                "PRODUCT_NOT_FOUND",
-                "Product " + to_string(id) + " was not found"
-            );
-        }
-
-        HttpResponse response;
-        response.statusCode = 200;
-        response.headers["Content-Type"] =
-            "application/json";
-        response.body =
-            "{\"data\":" + product->toJson() + "}";
-
-        return response;
-    }
-
-    HttpResponse listProducts(
-        const optional<string>& category = nullopt,
-        const optional<double>& minimumPrice = nullopt,
-        const optional<double>& maximumPrice = nullopt,
-        int page = 1,
-        int limit = 10) const {
-        if (page < 1 || limit < 1 || limit > 100) {
-            return errorResponse(
-                400,
-                "INVALID_PAGINATION",
-                "page must be >= 1 and limit must be between 1 and 100"
-            );
-        }
-
-        vector<Product> products =
-            repository.list();
-
-        vector<Product> filtered;
-
-        for (const Product& product : products) {
-            if (category.has_value() &&
-                !matchesCategory(product, *category)) {
-                continue;
-            }
-
-            if (minimumPrice.has_value() &&
-                product.price < *minimumPrice) {
-                continue;
-            }
-
-            if (maximumPrice.has_value() &&
-                product.price > *maximumPrice) {
-                continue;
-            }
-
-            filtered.push_back(product);
-        }
-
-        const size_t start =
-            static_cast<size_t>(page - 1) *
-            static_cast<size_t>(limit);
-
-        const size_t end =
-            min(
-                start + static_cast<size_t>(limit),
-                filtered.size()
-            );
-
-        ostringstream body;
-
-        body << "{\"data\":[";
-
-        bool first = true;
-
-        if (start < filtered.size()) {
-            for (size_t index = start; index < end; ++index) {
-                if (!first) {
-                    body << ",";
-                }
-
-                body << filtered[index].toJson();
-                first = false;
-            }
-        }
-
-        const int total =
-            static_cast<int>(filtered.size());
-
-        const int pages =
-            total == 0
-                ? 0
-                : (total + limit - 1) / limit;
-
-        body << "],"
-             << "\"pagination\":{"
-             << "\"page\":" << page << ","
-             << "\"limit\":" << limit << ","
-             << "\"total\":" << total << ","
-             << "\"pages\":" << pages
-             << "}}";
-
-        HttpResponse response;
-        response.statusCode = 200;
-        response.headers["Content-Type"] =
-            "application/json";
-        response.body = body.str();
-
-        return response;
-    }
-
-    HttpResponse patchProduct(
-        int id,
-        const map<string, string>& body) {
-        const set<string> allowedFields{
-            "name",
-            "category",
-            "price",
-            "stock",
-            "active"
-        };
-
-        for (const auto& [field, value] : body) {
-            if (!allowedFields.count(field)) {
-                return errorResponse(
-                    400,
-                    "UNKNOWN_FIELD",
-                    "Unknown field: " + field
-                );
-            }
-        }
-
-        optional<string> name;
-        optional<string> category;
-        optional<double> price;
-        optional<int> stock;
-        optional<bool> active;
-
-        try {
-            if (body.count("name")) {
-                name = trim(body.at("name"));
-
-                if (name->empty()) {
-                    throw ValidationException(
-                        "name must not be empty"
-                    );
-                }
-            }
-
-            if (body.count("category")) {
-                category = trim(body.at("category"));
-
-                if (category->empty()) {
-                    throw ValidationException(
-                        "category must not be empty"
-                    );
-                }
-            }
-
-            if (body.count("price")) {
-                price =
-                    parseNonNegativeDouble(body, "price");
-            }
-
-            if (body.count("stock")) {
-                stock =
-                    parseNonNegativeInt(body, "stock");
-            }
-
-            if (body.count("active")) {
-                const string value =
-                    trim(body.at("active"));
-
-                if (value == "true") {
-                    active = true;
-                } else if (value == "false") {
-                    active = false;
-                } else {
-                    throw ValidationException(
-                        "active must be true or false"
-                    );
-                }
-            }
-        } catch (const ValidationException& exception) {
-            return errorResponse(
-                422,
-                "VALIDATION_ERROR",
-                exception.what()
-            );
-        }
-
-        if (!repository.patch(
-                id,
-                name,
-                category,
-                price,
-                stock,
-                active)) {
-            return errorResponse(
-                404,
-                "PRODUCT_NOT_FOUND",
-                "Product does not exist"
-            );
-        }
-
-        return getProduct(id);
-    }
-
-    HttpResponse deleteProduct(int id) {
-        if (!repository.erase(id)) {
-            return errorResponse(
-                404,
-                "PRODUCT_NOT_FOUND",
-                "Product does not exist"
-            );
-        }
-
-        HttpResponse response;
-        response.statusCode = 204;
-        return response;
-    }
-};
-
-// =============================================================================
-// Authentication and authorization
-// =============================================================================
-
-struct Identity {
-    int userId{};
-    string role;
-};
-
-class AuthenticationService {
-private:
-    unordered_map<string, Identity> tokens{
-        {"token-customer", {1, "customer"}},
-        {"token-admin", {2, "admin"}}
-    };
-
-public:
-    optional<Identity> authenticate(
-        const HttpRequest& request) const {
-        const auto iterator =
-            request.headers.find("Authorization");
-
-        if (iterator == request.headers.end()) {
-            return nullopt;
-        }
-
-        const string prefix = "Bearer ";
-
-        if (iterator->second.rfind(prefix, 0) != 0) {
-            return nullopt;
-        }
-
-        const string token =
-            iterator->second.substr(prefix.size());
-
-        const auto tokenIterator =
-            tokens.find(token);
-
-        if (tokenIterator == tokens.end()) {
-            return nullopt;
-        }
-
-        return tokenIterator->second;
-    }
-};
-
-class AuthorizationService {
-private:
-    map<string, set<string>> permissions{
-        {
-            "customer",
-            {"GET_PRODUCT"}
-        },
-        {
-            "admin",
-            {
-                "GET_PRODUCT",
-                "CREATE_PRODUCT",
-                "UPDATE_PRODUCT",
-                "DELETE_PRODUCT"
-            }
-        }
-    };
-
-public:
-    bool allowed(
-        const Identity& identity,
-        const string& permission) const {
-        const auto iterator =
-            permissions.find(identity.role);
-
-        if (iterator == permissions.end()) {
-            return false;
-        }
-
-        return iterator->second.count(permission) > 0;
-    }
-};
-
-// =============================================================================
-// Rate limiter
-// =============================================================================
-
-class FixedWindowRateLimiter {
-private:
-    struct Record {
-        size_t count{};
-        chrono::steady_clock::time_point startedAt;
-    };
-
-    size_t limit;
-    chrono::seconds window;
-    unordered_map<string, Record> clients;
-
-public:
-    FixedWindowRateLimiter(
-        size_t limit,
-        chrono::seconds window)
-        : limit(limit), window(window) {}
-
-    bool allow(const string& clientId) {
-        const auto now =
-            chrono::steady_clock::now();
-
-        auto iterator =
-            clients.find(clientId);
-
-        if (iterator == clients.end() ||
-            now - iterator->second.startedAt >= window) {
-            clients[clientId] =
-                Record{0, now};
-
-            iterator = clients.find(clientId);
-        }
-
-        if (iterator->second.count >= limit) {
-            return false;
-        }
-
-        ++iterator->second.count;
-        return true;
-    }
-};
-
-// =============================================================================
-// Request router
-// =============================================================================
-
-class Router {
-private:
-    using Handler =
-        function<HttpResponse(
-            const HttpRequest&,
-            const smatch&)>;
-
-    struct Route {
-        HttpMethod method;
-        regex pattern;
-        Handler handler;
-    };
-
-    vector<Route> routes;
-
-public:
-    void add(
-        HttpMethod method,
-        const string& pattern,
-        Handler handler) {
-        routes.push_back({
-            method,
-            regex(pattern),
-            move(handler)
-        });
-    }
-
-    HttpResponse dispatch(
-        const HttpRequest& request) const {
-        for (const Route& route : routes) {
-            if (route.method != request.method) {
-                continue;
-            }
-
-            smatch match;
-
-            if (regex_match(
-                    request.path,
-                    match,
-                    route.pattern)) {
-                return route.handler(
-                    request,
-                    match
-                );
-            }
-        }
-
-        HttpResponse response;
-        response.statusCode = 404;
-        response.headers["Content-Type"] =
-            "application/json";
-        response.body =
-            "{"
-            "\"error\":{"
-            "\"code\":\"ROUTE_NOT_FOUND\","
-            "\"message\":\"No matching endpoint\""
-            "}"
-            "}";
-
-        return response;
-    }
-};
-
-// =============================================================================
-// API Gateway simulation
-// =============================================================================
-
-class ApiGateway {
-private:
-    ProductApi api;
-    AuthenticationService authentication;
-    AuthorizationService authorization;
-    FixedWindowRateLimiter rateLimiter;
-
-    static HttpResponse unauthorized() {
-        HttpResponse response;
-        response.statusCode = 401;
-        response.headers["WWW-Authenticate"] =
-            "Bearer";
-        response.body =
-            "{"
-            "\"error\":{"
-            "\"code\":\"UNAUTHENTICATED\","
-            "\"message\":\"Valid authentication is required\""
-            "}"
-            "}";
-        return response;
-    }
-
-    static HttpResponse forbidden() {
-        HttpResponse response;
-        response.statusCode = 403;
-        response.body =
-            "{"
-            "\"error\":{"
-            "\"code\":\"FORBIDDEN\","
-            "\"message\":\"Operation is not permitted\""
-            "}"
-            "}";
-        return response;
-    }
-
-    static int extractId(
-        const smatch& match) {
-        return stoi(match[1].str());
-    }
-
-public:
-    ApiGateway()
-        : rateLimiter(
-            10,
-            chrono::seconds(60)) {}
-
-    ProductApi& productApi() {
-        return api;
-    }
-
-    HttpResponse handle(
-        const string& clientId,
-        const HttpRequest& request) {
-        if (!rateLimiter.allow(clientId)) {
-            HttpResponse response;
-            response.statusCode = 429;
-            response.body =
-                "{"
-                "\"error\":{"
-                "\"code\":\"RATE_LIMITED\","
-                "\"message\":\"Too many requests\""
-                "}"
-                "}";
-            return response;
-        }
-
-        const bool requiresAuthentication =
-            request.method != HttpMethod::GET;
-
-        optional<Identity> identity =
-            authentication.authenticate(request);
-
-        if (requiresAuthentication &&
-            !identity.has_value()) {
-            return unauthorized();
-        }
-
-        if (request.method == HttpMethod::GET) {
-            smatch match;
-
-            if (regex_match(
-                    request.path,
-                    match,
-                    regex(R"(^/api/v1/products/([0-9]+)$)"))) {
-                return api.getProduct(extractId(match));
-            }
-
-            if (request.path ==
-                "/api/v1/products") {
-                return api.listProducts();
-            }
-        }
-
-        if (request.method == HttpMethod::POST &&
-            request.path ==
-                "/api/v1/products") {
-            if (!identity.has_value() ||
-                !authorization.allowed(
-                    *identity,
-                    "CREATE_PRODUCT")) {
-                return forbidden();
-            }
-
-            return api.createProduct(request);
-        }
-
-        smatch match;
-
-        if (request.method == HttpMethod::PATCH &&
-            regex_match(
-                request.path,
-                match,
-                regex(R"(^/api/v1/products/([0-9]+)$)"))) {
-            if (!identity.has_value() ||
-                !authorization.allowed(
-                    *identity,
-                    "UPDATE_PRODUCT")) {
-                return forbidden();
-            }
-
-            return api.patchProduct(
-                extractId(match),
-                request.body
-            );
-        }
-
-        if (request.method ==
-                HttpMethod::DELETE_METHOD &&
-            regex_match(
-                request.path,
-                match,
-                regex(R"(^/api/v1/products/([0-9]+)$)"))) {
-            if (!identity.has_value() ||
-                !authorization.allowed(
-                    *identity,
-                    "DELETE_PRODUCT")) {
-                return forbidden();
-            }
-
-            return api.deleteProduct(
-                extractId(match)
-            );
-        }
-
-        HttpResponse response;
-        response.statusCode = 404;
-        response.body =
-            "{\"error\":{\"code\":\"ROUTE_NOT_FOUND\"}}";
-        return response;
-    }
-};
-
-// =============================================================================
-// Test helpers
-// =============================================================================
-
-void assertStatus(
-    const HttpResponse& response,
-    int expected) {
-    if (response.statusCode != expected) {
-        throw runtime_error(
-            "Expected HTTP " +
-            to_string(expected) +
-            " but received HTTP " +
-            to_string(response.statusCode)
-        );
-    }
-}
-
-// =============================================================================
-// Case study
-// =============================================================================
-
-void runCaseStudy() {
-    section(
-        "Industry Case Study: Product Catalog REST API"
-    );
-
-    /*
-     * The simulated architecture contains:
-     *
-     * Client
-     *   |
-     *   v
-     * API Gateway
-     *   |
-     *   +-- Authentication
-     *   +-- Authorization
-     *   +-- Rate Limiting
-     *   |
-     *   v
-     * Product API
-     *   |
-     *   v
-     * Repository
-     *
-     * The implementation keeps HTTP transport abstract so the focus remains
-     * on resource-oriented architecture and REST semantics.
-     */
-
-    ApiGateway gateway;
-
-    HttpRequest createRequest{
-        HttpMethod::POST,
-        "/api/v1/products",
-        {
-            {"Authorization", "Bearer token-admin"},
-            {"Content-Type", "application/json"}
-        },
-        {},
-        {
-            {"name", "Mechanical Keyboard"},
-            {"category", "electronics"},
-            {"price", "3499"},
-            {"stock", "25"}
-        }
-    };
-
-    cout << "\nPOST /api/v1/products\n";
-    HttpResponse createResponse =
-        gateway.handle(
-            "client-001",
-            createRequest
-        );
-
-    createResponse.print();
-    assertStatus(createResponse, 201);
-
-    cout << "\nGET /api/v1/products\n";
-
-    HttpRequest listRequest{
-        HttpMethod::GET,
-        "/api/v1/products"
-    };
-
-    HttpResponse listResponse =
-        gateway.handle(
-            "client-001",
-            listRequest
-        );
-
-    listResponse.print();
-    assertStatus(listResponse, 200);
-
-    /*
-     * The first product created receives ID 1 in this isolated application.
-     */
-    cout << "\nGET /api/v1/products/1\n";
-
-    HttpRequest getRequest{
-        HttpMethod::GET,
-        "/api/v1/products/1"
-    };
-
-    HttpResponse getResponse =
-        gateway.handle(
-            "client-001",
-            getRequest
-        );
-
-    getResponse.print();
-    assertStatus(getResponse, 200);
-
-    cout << "\nPATCH /api/v1/products/1\n";
-
-    HttpRequest patchRequest{
-        HttpMethod::PATCH,
-        "/api/v1/products/1",
-        {
-            {"Authorization", "Bearer token-admin"},
-            {"Content-Type", "application/json"}
-        },
-        {},
-        {
-            {"price", "3299"},
-            {"stock", "30"}
-        }
-    };
-
-    HttpResponse patchResponse =
-        gateway.handle(
-            "client-001",
-            patchRequest
-        );
-
-    patchResponse.print();
-    assertStatus(patchResponse, 200);
-
-    cout << "\nGET /api/v1/products/999\n";
-
-    HttpRequest missingRequest{
-        HttpMethod::GET,
-        "/api/v1/products/999"
-    };
-
-    HttpResponse missingResponse =
-        gateway.handle(
-            "client-001",
-            missingRequest
-        );
-
-    missingResponse.print();
-    assertStatus(missingResponse, 404);
-
-    cout << "\nPOST without authentication\n";
-
-    HttpRequest unauthenticatedCreate{
-        HttpMethod::POST,
-        "/api/v1/products",
-        {},
-        {},
-        {
-            {"name", "Unauthorized Product"},
-            {"category", "test"},
-            {"price", "100"},
-            {"stock", "1"}
-        }
-    };
-
-    HttpResponse unauthorizedResponse =
-        gateway.handle(
-            "client-002",
-            unauthenticatedCreate
-        );
-
-    unauthorizedResponse.print();
-    assertStatus(unauthorizedResponse, 401);
-
-    cout << "\nDELETE /api/v1/products/1\n";
-
-    HttpRequest deleteRequest{
-        HttpMethod::DELETE_METHOD,
-        "/api/v1/products/1",
-        {
-            {"Authorization", "Bearer token-admin"}
-        }
-    };
-
-    HttpResponse deleteResponse =
-        gateway.handle(
-            "client-001",
-            deleteRequest
-        );
-
-    deleteResponse.print();
-    assertStatus(deleteResponse, 204);
-
-    cout << "\nGET /api/v1/products/1 after deletion\n";
-
-    HttpResponse deletedGetResponse =
-        gateway.handle(
-            "client-001",
-            getRequest
-        );
-
-    deletedGetResponse.print();
-    assertStatus(deletedGetResponse, 404);
-}
-
-// =============================================================================
-// Concept demonstrations
-// =============================================================================
-
-void demonstrateRESTConcepts() {
-    section("REST architectural concepts");
-
-    cout << "Resource: a conceptual product exposed by the API.\n";
-    cout << "Endpoint: an HTTP method combined with a URI pattern.\n";
-    cout << "Representation: JSON representation of a product.\n";
-    cout << "Statelessness: each request contains its required context.\n";
-    cout << "Uniform interface: HTTP methods and resource identifiers provide "
-            "standard interaction semantics.\n";
-    cout << "Layered architecture: gateways, services, and repositories may "
-            "operate as separate layers.\n";
-    cout << "Cacheability: responses can communicate cache policy through "
-            "HTTP headers.\n";
-}
-
-void demonstrateMethods() {
-    section("HTTP method semantics");
-
-    cout << left
-         << setw(12) << "Method"
-         << setw(28) << "Typical meaning"
-         << setw(14) << "Safe"
-         << setw(16) << "Idempotent"
-         << "\n";
-
-    cout << string(70, '-') << "\n";
-
-    cout << setw(12) << "GET"
-         << setw(28) << "Retrieve"
-         << setw(14) << "Yes"
-         << setw(16) << "Yes"
-         << "\n";
-
-    cout << setw(12) << "POST"
-         << setw(28) << "Create/process"
-         << setw(14) << "No"
-         << setw(16) << "Usually no"
-         << "\n";
-
-    cout << setw(12) << "PUT"
-         << setw(28) << "Replace"
-         << setw(14) << "No"
-         << setw(16) << "Yes"
-         << "\n";
-
-    cout << setw(12) << "PATCH"
-         << setw(28) << "Partial update"
-         << setw(14) << "No"
-         << setw(16) << "Depends"
-         << "\n";
-
-    cout << setw(12) << "DELETE"
-         << setw(28) << "Remove"
-         << setw(14) << "No"
-         << setw(16) << "Yes"
-         << "\n";
-}
-
-void demonstrateTradeoffs() {
-    section("Design trade-offs");
-
-    cout << "Offset pagination:\n";
-    cout << "  Simple client model, but large offsets can become expensive.\n";
-
-    cout << "\nCursor pagination:\n";
-    cout << "  Better for large or changing datasets, but requires more state in "
-            "the cursor protocol.\n";
-
-    cout << "\nNested resources:\n";
-    cout << "  /users/7/orders/22 clearly expresses a relationship, but deep "
-            "nesting can become difficult to manage.\n";
-
-    cout << "\nFlat resources:\n";
-    cout << "  /orders/22 directly addresses an order, while relationships can "
-            "be represented through links or fields.\n";
-}
-
-void demonstratePerformance() {
-    section("Performance considerations");
-
-    cout << "Repository lookup uses std::map and is approximately O(log n).\n";
-    cout << "Listing all products is O(n).\n";
-    cout << "Filtering a vector of n products is O(n).\n";
-    cout << "Pagination after filtering is O(n) for the in-memory model.\n";
-    cout << "Production databases should use suitable indexes and query plans.\n";
-    cout << "Network latency, serialization, database I/O, connection pools, "
-            "caching, and downstream services can dominate API latency.\n";
-}
-
-void demonstrateSecurity() {
-    section("Security considerations");
-
-    cout << "1. Use HTTPS/TLS for sensitive API traffic.\n";
-    cout << "2. Authenticate protected requests.\n";
-    cout << "3. Authorize every sensitive resource operation.\n";
-    cout << "4. Validate identifiers and request bodies.\n";
-    cout << "5. Apply rate limiting where abuse is possible.\n";
-    cout << "6. Avoid returning internal implementation details in errors.\n";
-    cout << "7. Verify resource ownership in multi-user applications.\n";
-    cout << "8. Protect credentials, tokens, and encryption keys.\n";
-    cout << "9. Record appropriate security and audit events.\n";
-}
-
-void demonstrateEdgeCases() {
-    section("Edge cases");
-
-    ProductApi api;
-
-    HttpRequest invalidRequest{
-        HttpMethod::POST,
-        "/api/v1/products",
-        {},
-        {},
-        {
-            {"name", ""},
-            {"category", "electronics"},
-            {"price", "-50"},
-            {"stock", "-1"}
-        }
-    };
-
-    HttpResponse invalidResponse =
-        api.createProduct(invalidRequest);
-
-    cout << "Invalid product request:\n";
-    invalidResponse.print();
-
-    assertStatus(invalidResponse, 422);
-
-    HttpResponse missing =
-        api.getProduct(999999);
-
-    cout << "\nMissing product:\n";
-    missing.print();
-
-    assertStatus(missing, 404);
-
-    HttpResponse invalidPagination =
-        api.listProducts(
-            nullopt,
-            nullopt,
-            nullopt,
-            0,
-            200
-        );
-
-    cout << "\nInvalid pagination:\n";
-    invalidPagination.print();
-
-    assertStatus(invalidPagination, 400);
-}
-
-// =============================================================================
-// Main
-// =============================================================================
-
-int main() {
-    try {
-        demonstrateRESTConcepts();
-        demonstrateMethods();
-        runCaseStudy();
-        demonstrateTradeoffs();
-        demonstratePerformance();
-        demonstrateSecurity();
-        demonstrateEdgeCases();
-
-        section("Case study validation");
-        cout << "All critical assertions passed.\n";
-        cout << "The simulated REST architecture completed successfully.\n";
-
-        return 0;
-    } catch (const exception& exception) {
-        cerr << "Fatal error: "
-             << exception.what()
-             << "\n";
-
-        return 1;
-    }
-}
+# Day 10 — Best, average and worst case
+
+[View Day 10 on GitHub](https://github.com/ATULPANDEYIITR/dsa_data_structures_and_algorithm_preparation#day-10--best-average-and-worst-case)
+
+## Topic scope
+
+This chapter focuses on analyzing the efficiency of algorithms and data-structure operations using time and space complexity.
+
+The main concepts covered are:
+
+- Algorithmic complexity
+- Best-case complexity
+- Average-case complexity
+- Worst-case complexity
+- Asymptotic notation
+- Big O notation
+- Growth rates
+- Searching algorithms
+- Sorting algorithms
+- Hash tables
+- Arrays and dynamic arrays
+- Linked lists
+- Amortized analysis
+- Practical complexity analysis
+- Security and performance considerations
+- Implementation considerations in Python, JavaScript, and C++
+
+## What algorithmic complexity means
+
+Algorithmic complexity describes how the resource requirements of an algorithm change as the size of the input increases.
+
+The two primary resources are:
+
+- **Time complexity** — how the number of operations grows with input size.
+- **Space complexity** — how the amount of additional memory grows with input size.
+
+If an algorithm processes `n` elements and performs approximately `n` operations, its time complexity is linear.
+
+If it performs approximately `n²` operations, its time complexity is quadratic.
+
+The objective of complexity analysis is not normally to determine the exact number of processor instructions. Instead, it identifies how the algorithm scales as the input becomes larger.
+
+## Best-case, average-case and worst-case complexity
+
+An algorithm can behave differently depending on the arrangement of the input.
+
+### Best case
+
+The best case represents the most favorable input.
+
+For example, when searching for an element using linear search, the element may be the first element in the collection.
+
+Only one comparison is required.
+
+The best-case time complexity is therefore:
+
+`O(1)`
+
+### Average case
+
+The average case describes expected behavior across typical inputs.
+
+For linear search, if the requested element is equally likely to appear at any position, approximately half of the elements are examined on average.
+
+The average-case complexity is:
+
+`O(n)`
+
+### Worst case
+
+The worst case represents the maximum amount of work required for an input of size `n`.
+
+For linear search, the requested element may be the final element or may not exist at all.
+
+The algorithm may therefore inspect every element.
+
+The worst-case complexity is:
+
+`O(n)`
+
+## Asymptotic notation
+
+Asymptotic notation describes how an algorithm grows as the input size becomes large.
+
+The most common notation is Big O.
+
+### Big O notation
+
+Big O provides an upper-bound style description of growth and is commonly used to describe worst-case scalability.
+
+Common examples include:
+
+- `O(1)` — constant
+- `O(log n)` — logarithmic
+- `O(n)` — linear
+- `O(n log n)` — linearithmic
+- `O(n²)` — quadratic
+- `O(n³)` — cubic
+- `O(2ⁿ)` — exponential
+- `O(n!)` — factorial
+
+The difference between these growth rates becomes increasingly important as `n` increases.
+
+## Why constants are ignored
+
+Consider two algorithms:
+
+`5n`
+
+and:
+
+`100n`
+
+Both are linear.
+
+Their exact runtimes can differ significantly for a particular machine or implementation, but their growth pattern is the same.
+
+Big O therefore focuses on the dominant growth term.
+
+For example:
+
+`3n² + 5n + 10`
+
+is simplified to:
+
+`O(n²)`
+
+The lower-order terms and constant factors are ignored when describing asymptotic growth.
+
+This does not mean constants are irrelevant in real software. Constants can have a major effect on actual runtime. They are simply omitted when classifying asymptotic growth.
+
+## Growth-rate hierarchy
+
+A simplified growth-rate hierarchy from generally slower growth to faster growth is:
+
+`O(1) < O(log n) < O(n) < O(n log n) < O(n²) < O(n³) < O(2ⁿ) < O(n!)`
+
+The difference becomes substantial for large inputs.
+
+For example:
+
+- An `O(1)` operation remains approximately constant.
+- An `O(log n)` algorithm grows very slowly.
+- An `O(n)` algorithm grows proportionally with input size.
+- An `O(n log n)` algorithm is common for efficient comparison sorting.
+- An `O(n²)` algorithm can become expensive for large collections.
+- Exponential and factorial algorithms become impractical very quickly.
+
+## Linear search
+
+Linear search examines elements sequentially until the target is found or the collection is exhausted.
+
+For an array:
+
+`[10, 20, 30, 40, 50]`
+
+Searching for `40` checks:
+
+`10 → 20 → 30 → 40`
+
+Searching for `100` checks every element.
+
+### Linear search complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(1)` |
+| Average case | `O(n)` |
+| Worst case | `O(n)` |
+| Space | `O(1)` |
+
+Linear search requires no special ordering of the data.
+
+### Linear search edge cases
+
+Important cases include:
+
+- Empty collection
+- Single-element collection
+- Target at the first position
+- Target at the last position
+- Target absent
+- Duplicate values
+- Very large collection
+
+For an empty collection, the search completes immediately.
+
+For a single-element collection, the search requires at most one comparison.
+
+If duplicates exist, the implementation must define whether it returns the first occurrence, last occurrence, all occurrences, or simply any occurrence.
+
+## Binary search
+
+Binary search repeatedly divides a sorted search space into two parts.
+
+Suppose the sorted array is:
+
+`[10, 20, 30, 40, 50, 60, 70]`
+
+To search for `60`, the algorithm examines the middle element and determines whether the target lies to the left or right.
+
+The search space is repeatedly reduced by approximately half.
+
+### Binary search requirements
+
+Binary search normally requires:
+
+- Random access to elements
+- Sorted data
+- A comparison operation that establishes ordering
+
+If the data is not sorted, ordinary binary search cannot be applied correctly.
+
+### Binary search complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(1)` |
+| Average case | `O(log n)` |
+| Worst case | `O(log n)` |
+| Space | `O(1)` for an iterative implementation |
+
+The logarithmic behavior comes from repeatedly halving the search space.
+
+For example:
+
+`1,000,000`
+
+elements can be reduced to approximately:
+
+`500,000 → 250,000 → 125,000 → ...`
+
+Only a small number of divisions are required compared with scanning every element.
+
+### Linear search versus binary search
+
+| Feature | Linear Search | Binary Search |
+|---|---|---|
+| Data must be sorted | No | Yes |
+| Best case | `O(1)` | `O(1)` |
+| Average case | `O(n)` | `O(log n)` |
+| Worst case | `O(n)` | `O(log n)` |
+| Random access required | No | Usually yes |
+| Simple implementation | Yes | Moderate |
+| Good for unsorted data | Yes | No |
+| Good for repeated searches | Sometimes | Yes |
+
+If the collection is small or unsorted, linear search may be perfectly adequate.
+
+If the collection is sorted and many searches are performed, binary search can substantially reduce search work.
+
+## Sorting algorithms
+
+Sorting rearranges data according to an ordering rule.
+
+Examples include:
+
+- Ascending numeric order
+- Descending numeric order
+- Alphabetical order
+- Sorting records by age
+- Sorting records by score
+- Sorting objects by multiple fields
+
+Different sorting algorithms have different complexity characteristics.
+
+## Bubble sort
+
+Bubble sort repeatedly compares neighboring elements and swaps them when they are in the wrong order.
+
+For:
+
+`[5, 2, 4, 1]`
+
+the algorithm compares adjacent values and gradually moves larger values toward the end.
+
+### Bubble sort complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(n)` with an early-exit optimization |
+| Average case | `O(n²)` |
+| Worst case | `O(n²)` |
+| Space | `O(1)` |
+
+Bubble sort is easy to understand but is generally inefficient for large datasets.
+
+## Selection sort
+
+Selection sort repeatedly identifies the smallest remaining element and places it into its final position.
+
+For example:
+
+`[5, 2, 4, 1]`
+
+The smallest element, `1`, is selected and placed at the beginning.
+
+The process continues with the remaining elements.
+
+### Selection sort complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(n²)` |
+| Average case | `O(n²)` |
+| Worst case | `O(n²)` |
+| Space | `O(1)` |
+
+Selection sort performs roughly the same number of comparisons regardless of whether the input is already sorted.
+
+## Insertion sort
+
+Insertion sort builds a sorted section of the collection one element at a time.
+
+For example:
+
+`[5, 2, 4, 1]`
+
+The algorithm treats the first element as sorted and inserts subsequent elements into the appropriate position.
+
+### Insertion sort complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(n)` |
+| Average case | `O(n²)` |
+| Worst case | `O(n²)` |
+| Space | `O(1)` |
+
+Insertion sort performs well on:
+
+- Small collections
+- Nearly sorted data
+- Data arriving incrementally
+
+## Merge sort
+
+Merge sort uses divide and conquer.
+
+The collection is divided into smaller parts until individual elements remain.
+
+The smaller sorted collections are then merged together.
+
+For example:
+
+`[8, 3, 5, 1]`
+
+can be divided into:
+
+`[8, 3]` and `[5, 1]`
+
+which are further divided and then merged in sorted order.
+
+### Merge sort complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(n log n)` |
+| Average case | `O(n log n)` |
+| Worst case | `O(n log n)` |
+| Space | `O(n)` for a typical implementation |
+
+Merge sort provides predictable performance but normally requires additional memory for merging.
+
+## Quicksort
+
+Quicksort also uses divide and conquer.
+
+A pivot is selected and the collection is partitioned around the pivot.
+
+Values smaller than the pivot are placed on one side and larger values on the other side.
+
+The partitions are recursively sorted.
+
+### Quicksort complexity
+
+| Case | Complexity |
+|---|---|
+| Best case | `O(n log n)` |
+| Average case | `O(n log n)` |
+| Worst case | `O(n²)` |
+| Space | Typically `O(log n)` average recursion stack, depending on implementation |
+
+The worst case can occur when pivot selection produces highly unbalanced partitions.
+
+Good pivot-selection strategies reduce the likelihood of poor partitioning.
+
+## Sorting comparison
+
+| Algorithm | Best | Average | Worst | Typical extra space |
+|---|---:|---:|---:|---:|
+| Bubble sort | `O(n)`* | `O(n²)` | `O(n²)` | `O(1)` |
+| Selection sort | `O(n²)` | `O(n²)` | `O(n²)` | `O(1)` |
+| Insertion sort | `O(n)` | `O(n²)` | `O(n²)` | `O(1)` |
+| Merge sort | `O(n log n)` | `O(n log n)` | `O(n log n)` | `O(n)` |
+| Quicksort | `O(n log n)` | `O(n log n)` | `O(n²)` | Depends on recursion and implementation |
+
+`*` Bubble sort achieves `O(n)` best-case behavior when implemented with an early-exit check for an already sorted collection.
+
+## Hash tables
+
+A hash table stores data using a hash function that maps keys to positions in an underlying table.
+
+For example:
+
+`"alice" → hash("alice") → index`
+
+This allows direct access to a location based on the key.
+
+### Hash-table complexity
+
+| Operation | Average | Worst |
+|---|---:|---:|
+| Search | `O(1)` | `O(n)` |
+| Insert | `O(1)` | `O(n)` |
+| Delete | `O(1)` | `O(n)` |
+
+The average `O(1)` behavior depends on a good hash function, appropriate table sizing, and effective collision handling.
+
+### Hash collisions
+
+A collision occurs when two different keys map to the same table location.
+
+For example:
+
+`hash("Alice") = 10`
+
+and:
+
+`hash("Bob") = 10`
+
+Possible collision-handling approaches include:
+
+- Separate chaining
+- Open addressing
+- Linear probing
+- Quadratic probing
+- Double hashing
+
+Poor collision behavior can degrade performance toward `O(n)`.
+
+## Arrays
+
+Arrays provide contiguous or logically indexed storage depending on the underlying language and implementation.
+
+Typical operations include:
+
+- Access by index
+- Update by index
+- Search
+- Insert
+- Delete
+- Append
+
+### Array operation complexity
+
+| Operation | Typical complexity |
+|---|---:|
+| Access by index | `O(1)` |
+| Update by index | `O(1)` |
+| Search unsorted array | `O(n)` |
+| Search sorted array using binary search | `O(log n)` |
+| Insert at beginning | `O(n)` |
+| Insert in middle | `O(n)` |
+| Delete from beginning | `O(n)` |
+| Delete from middle | `O(n)` |
+| Append to fixed-capacity array | `O(1)` if space exists |
+
+Insertion or deletion in the middle can require shifting many elements.
+
+## Dynamic arrays
+
+Dynamic arrays automatically resize when their current capacity becomes insufficient.
+
+Examples include:
+
+- Python lists
+- JavaScript arrays
+- C++ `std::vector`
+
+Appending to a dynamic array is usually:
+
+`O(1)` amortized
+
+A resize operation itself may require:
+
+`O(n)`
+
+elements to be copied.
+
+### Amortized analysis
+
+Amortized analysis studies the average cost of a sequence of operations rather than treating every operation independently.
+
+Suppose a dynamic array doubles its capacity when full.
+
+Most append operations require constant work.
+
+Occasionally, a resize copies many elements.
+
+Over a long sequence of append operations, the total work is still proportional to the number of inserted elements.
+
+Therefore:
+
+`append = O(1) amortized`
+
+This does not mean every append is literally `O(1)`.
+
+A particular append that triggers resizing may take `O(n)`.
+
+## Linked lists
+
+A singly linked list consists of nodes where each node stores data and a reference to the next node.
+
+Conceptually:
+
+`Node → Node → Node → None`
+
+Each node can be located separately in memory.
+
+### Linked-list operation complexity
+
+| Operation | Complexity |
+|---|---:|
+| Access by index | `O(n)` |
+| Search | `O(n)` |
+| Insert at head | `O(1)` |
+| Delete at head | `O(1)` |
+| Insert after known node | `O(1)` |
+| Delete after known node | `O(1)` |
+| Append without tail pointer | `O(n)` |
+| Append with tail pointer | `O(1)` |
+
+The major difference between arrays and linked lists is how elements are accessed.
+
+Arrays provide direct indexed access.
+
+Linked lists require traversal from a known starting point.
+
+## Array versus linked list
+
+| Feature | Array | Linked List |
+|---|---|---|
+| Random access | `O(1)` | `O(n)` |
+| Search | `O(n)` | `O(n)` |
+| Insert at beginning | `O(n)` | `O(1)` |
+| Delete at beginning | `O(n)` | `O(1)` |
+| Memory layout | Typically contiguous | Nodes can be distributed |
+| Extra pointer/reference memory | No per-element link required | Required |
+| Cache locality | Usually strong | Usually weaker |
+| Resizing | May require reallocation | Usually not required |
+
+The correct data structure depends on the operation pattern.
+
+## C++ student record case study
+
+Consider a collection of student records:
+
+`Student`
+
+with fields such as:
+
+- Student ID
+- Name
+- Age
+- Course
+- Score
+
+Suppose the program stores:
+
+`n`
+
+student records.
+
+### Record validation
+
+A validation operation might check:
+
+- ID format
+- Name validity
+- Age range
+- Course validity
+- Score range
+
+If each record is validated independently and each validation takes constant work, validating all records requires:
+
+`O(n)`
+
+time.
+
+If validation includes operations whose complexity depends on the number of fields or related records, that additional cost must also be considered.
+
+### Linear search in the case study
+
+Suppose the program searches for a student by ID using a vector.
+
+A sequential search may inspect:
+
+`1, 2, 3, ..., n`
+
+records.
+
+The complexity is:
+
+- Best case: `O(1)`
+- Average case: `O(n)`
+- Worst case: `O(n)`
+
+### Sorting before repeated searches
+
+Suppose the application repeatedly searches a large collection by student ID.
+
+One strategy is:
+
+- Sort the records by ID.
+- Use binary search for each query.
+
+Sorting may cost:
+
+`O(n log n)`
+
+For example, using merge sort.
+
+Each binary search then costs:
+
+`O(log n)`
+
+For `q` searches, the total approximate complexity becomes:
+
+`O(n log n + q log n)`
+
+This can be preferable to performing `q` linear searches:
+
+`O(qn)`
+
+when the same dataset is searched many times.
+
+### Hash-table index
+
+Another approach is to create a hash table:
+
+`student_id → student record`
+
+Building the index generally requires:
+
+`O(n)` average time.
+
+A lookup is:
+
+`O(1)` average
+
+and:
+
+`O(n)` worst case
+
+under poor collision conditions.
+
+For repeated lookups, a hash-based index can provide very fast average access.
+
+### Linked-list representation
+
+If student records are stored in a singly linked list, searching by student ID requires traversal.
+
+Therefore:
+
+- Best case: `O(1)`
+- Average case: `O(n)`
+- Worst case: `O(n)`
+
+If a record is already known through a node reference, inserting or deleting adjacent nodes can be `O(1)`.
+
+The structure is therefore useful for certain insertion and deletion patterns but does not provide efficient random access.
+
+## Complexity reference sheet
+
+### Searching
+
+| Algorithm | Best | Average | Worst |
+|---|---:|---:|---:|
+| Linear search | `O(1)` | `O(n)` | `O(n)` |
+| Binary search | `O(1)` | `O(log n)` | `O(log n)` |
+| Hash-table lookup | `O(1)` | `O(1)` | `O(n)` |
+
+### Sorting
+
+| Algorithm | Best | Average | Worst |
+|---|---:|---:|---:|
+| Bubble sort | `O(n)`* | `O(n²)` | `O(n²)` |
+| Selection sort | `O(n²)` | `O(n²)` | `O(n²)` |
+| Insertion sort | `O(n)` | `O(n²)` | `O(n²)` |
+| Merge sort | `O(n log n)` | `O(n log n)` | `O(n log n)` |
+| Quicksort | `O(n log n)` | `O(n log n)` | `O(n²)` |
+
+### Hash tables
+
+| Operation | Average | Worst |
+|---|---:|---:|
+| Search | `O(1)` | `O(n)` |
+| Insert | `O(1)` | `O(n)` |
+| Delete | `O(1)` | `O(n)` |
+
+### Dynamic arrays
+
+| Operation | Complexity |
+|---|---:|
+| Index access | `O(1)` |
+| Update | `O(1)` |
+| Search | `O(n)` |
+| Append | `O(1)` amortized |
+| Resize | `O(n)` |
+| Insert in middle | `O(n)` |
+| Delete in middle | `O(n)` |
+
+### Singly linked lists
+
+| Operation | Complexity |
+|---|---:|
+| Access by index | `O(n)` |
+| Search | `O(n)` |
+| Insert at head | `O(1)` |
+| Delete at head | `O(1)` |
+| Insert after known node | `O(1)` |
+| Delete after known node | `O(1)` |
+| Append with tail pointer | `O(1)` |
+
+## Important distinctions
+
+### Worst-case complexity is not actual runtime
+
+If an algorithm has worst-case complexity `O(n²)`, it does not mean every execution performs `n²` operations.
+
+Worst-case complexity describes how bad the algorithm can become for an input of size `n`.
+
+Real runtime also depends on:
+
+- Input distribution
+- Hardware
+- Programming language
+- Compiler or interpreter
+- Memory hierarchy
+- Implementation details
+- Constant factors
+- Operating-system behavior
+- Other running processes
+
+### Average complexity is not the same as amortized complexity
+
+Average-case analysis considers expected behavior over a distribution of inputs.
+
+Amortized analysis considers the total cost of a sequence of operations.
+
+For example:
+
+- Hash-table lookup may have expected `O(1)` average complexity under appropriate assumptions.
+- Dynamic-array append is `O(1)` amortized even though individual resizing operations can cost `O(n)`.
+
+These are different concepts.
+
+## Edge cases
+
+Complexity analysis should account for important input conditions.
+
+### Empty input
+
+For:
+
+`n = 0`
+
+many algorithms return immediately.
+
+For example, searching an empty collection may take constant work:
+
+`O(1)`
+
+### Single element
+
+For:
+
+`n = 1`
+
+many algorithms complete almost immediately.
+
+The asymptotic classification still matters because complexity describes how behavior changes as `n` grows.
+
+### Duplicate values
+
+Duplicates can affect:
+
+- Search results
+- Sorting behavior
+- Stability
+- Hash-table representation
+- Record indexing
+
+The implementation must define the expected behavior.
+
+### Already sorted input
+
+Already sorted data can significantly improve some algorithms.
+
+Insertion sort can operate in:
+
+`O(n)`
+
+when the input is already sorted.
+
+An optimized bubble sort can also achieve:
+
+`O(n)`
+
+when no swaps are required.
+
+### Reverse-sorted input
+
+Reverse-sorted data can produce poor behavior for some algorithms.
+
+For example, insertion sort may require approximately quadratic work:
+
+`O(n²)`
+
+and a poorly implemented quicksort can also reach:
+
+`O(n²)`.
+
+## Common mistakes
+
+### Confusing Big O with exact runtime
+
+`O(n)` does not mean exactly `n` seconds or exactly `n` operations.
+
+It describes asymptotic growth.
+
+### Ignoring input requirements
+
+Binary search requires sorted data.
+
+A binary search implementation cannot simply be applied to arbitrary unsorted data.
+
+### Assuming hash tables are always O(1)
+
+Hash-table operations are commonly `O(1)` on average, not guaranteed `O(1)` in every possible situation.
+
+Collisions and implementation details matter.
+
+### Forgetting the cost of sorting
+
+If data must first be sorted before binary search can be used, the sorting cost must be included when analyzing the entire workflow.
+
+For example:
+
+`O(n log n) + O(log n)`
+
+for one search after sorting is effectively:
+
+`O(n log n)`
+
+for the complete process.
+
+### Ignoring repeated operations
+
+A single linear search may be acceptable.
+
+Thousands or millions of linear searches over the same dataset may become expensive.
+
+The total workload must be considered.
+
+### Confusing space complexity with total memory usage
+
+Space complexity commonly focuses on additional or auxiliary memory required by the algorithm.
+
+The memory required to store the original input may be discussed separately depending on the analysis.
+
+## Performance considerations
+
+Complexity is important, but it is not the only factor affecting performance.
+
+Other considerations include:
+
+- Cache locality
+- Memory allocation
+- Branch prediction
+- Data representation
+- CPU architecture
+- Input/output operations
+- Network latency
+- Database latency
+- Concurrency
+- Garbage collection
+- Interpreter or runtime overhead
+
+An algorithm with theoretically better asymptotic complexity may not always be faster for small inputs.
+
+For example, a simple `O(n²)` algorithm can sometimes outperform a more complicated `O(n log n)` algorithm on very small datasets because of lower constant overhead.
+
+## Security considerations
+
+Complexity analysis also matters for security.
+
+Algorithms with poor worst-case behavior can be exploited through specially constructed inputs.
+
+Examples include:
+
+- Hash-table collision attacks
+- Algorithmic complexity attacks
+- Denial-of-service through expensive parsing
+- Worst-case sorting behavior
+- Excessive recursion
+- Memory exhaustion
+- Repeated expensive searches
+
+When processing untrusted input, developers should consider both normal-case performance and adversarial inputs.
+
+Good engineering practices include:
+
+- Validating input
+- Limiting input sizes
+- Avoiding predictable worst-case behavior where possible
+- Choosing robust algorithms
+- Monitoring resource usage
+- Applying appropriate timeouts
+- Avoiding uncontrolled recursion
+
+## Implementation considerations in Python
+
+Python provides built-in data structures that hide many implementation details.
+
+Common examples include:
+
+- `list`
+- `dict`
+- `set`
+- `tuple`
+
+Typical operations include:
+
+`list[index]`
+
+for constant-time indexed access.
+
+Dictionary lookup is generally expected to be:
+
+`O(1)`
+
+on average.
+
+Appending to a Python list is:
+
+`O(1)` amortized.
+
+Searching a list is:
+
+`O(n)`
+
+unless another structure or algorithm is used.
+
+## Implementation considerations in JavaScript
+
+JavaScript arrays are dynamic structures and can support indexed access and append operations efficiently in typical implementations.
+
+Objects and `Map` can be used for key-based lookup.
+
+For example:
+
+`map.get(key)`
+
+typically provides expected constant-time lookup.
+
+When analyzing JavaScript applications, consider:
+
+- Dynamic typing
+- JavaScript engine optimizations
+- Garbage collection
+- Array representation
+- Object property behavior
+- Browser or Node.js runtime characteristics
+
+Asymptotic complexity remains useful even though runtime implementations can be highly optimized.
+
+## Implementation considerations in C++
+
+C++ provides direct control over many data structures and memory-related decisions.
+
+Common structures include:
+
+- `std::vector`
+- `std::list`
+- `std::unordered_map`
+- `std::map`
+- `std::array`
+
+Typical complexity examples include:
+
+`std::vector` indexed access: `O(1)`
+
+`std::vector` amortized append: `O(1)`
+
+`std::unordered_map` average lookup: `O(1)`
+
+`std::map` lookup: `O(log n)`
+
+`std::list` insertion or deletion at a known iterator position: `O(1)`
+
+The actual performance depends on the workload, memory behavior, and implementation.
+
+## Practical application patterns
+
+### Small data
+
+For small datasets, simplicity may be more important than asymptotic optimization.
+
+A straightforward linear search or insertion sort may be entirely appropriate.
+
+### Large data
+
+As the dataset grows, growth rate becomes increasingly important.
+
+An `O(n²)` algorithm can become significantly slower than an `O(n log n)` algorithm.
+
+### Repeated searches
+
+When the same dataset is queried repeatedly, preprocessing may be worthwhile.
+
+Possible strategies include:
+
+- Sorting followed by binary search
+- Building a hash-table index
+- Creating database indexes
+- Caching frequently accessed values
+
+### Dynamic workloads
+
+When data changes frequently, maintaining a sorted structure may have a different cost from using a hash-based structure.
+
+The correct choice depends on:
+
+- Number of reads
+- Number of writes
+- Ordering requirements
+- Memory constraints
+- Lookup requirements
+
+## Complexity analysis process
+
+A practical process for analyzing an algorithm is:
+
+### Identify the input size
+
+Determine what `n` represents.
+
+For example:
+
+- Number of array elements
+- Number of records
+- Number of graph vertices
+- Number of characters
+- Number of queries
+
+### Identify the dominant operations
+
+Look for:
+
+- Loops
+- Nested loops
+- Recursion
+- Sorting
+- Searching
+- Hash-table operations
+- Data copying
+- Memory allocation
+
+### Count repeated work
+
+A single loop over `n` elements usually gives:
+
+`O(n)`
+
+Two independent loops give:
+
+`O(n + n) = O(n)`
+
+Nested loops often give:
+
+`O(n²)`
+
+### Check whether operations are sequential
+
+If an algorithm performs:
+
+`O(n)`
+
+followed by:
+
+`O(n)`
+
+the total is:
+
+`O(n + n) = O(n)`
+
+The dominant growth rate remains linear.
+
+### Check nested operations
+
+If one `O(n)` operation occurs inside another `O(n)` operation:
+
+`O(n × n) = O(n²)`
+
+### Check divide and conquer
+
+If an algorithm repeatedly divides the input and processes each level efficiently, the complexity may be:
+
+`O(log n)`
+
+or:
+
+`O(n log n)`
+
+depending on the amount of work performed at each level.
+
+## Sequential algorithms
+
+Suppose an algorithm contains:
+
+`for each element in n:`
+
+followed by:
+
+`for each element in n:`
+
+The total is:
+
+`O(n + n)`
+
+which simplifies to:
+
+`O(n)`
+
+Constants are ignored in asymptotic notation.
+
+## Nested algorithms
+
+Suppose:
+
+`for each element in n:`
+`    for each element in n:`
+
+The inner loop executes approximately `n` times for each of the `n` outer iterations.
+
+Therefore:
+
+`O(n × n) = O(n²)`
+
+Nested loops do not always automatically mean `O(n²)`. The exact relationship between loop bounds must be analyzed.
+
+For example, if the inner loop executes a constant number of times, the total may still be:
+
+`O(n)`.
+
+## Divide-and-conquer algorithms
+
+Merge sort demonstrates divide and conquer.
+
+The input is divided into approximately equal halves.
+
+There are approximately:
+
+`log n`
+
+levels.
+
+At each level, approximately:
+
+`O(n)`
+
+work is performed to merge the elements.
+
+Therefore:
+
+`O(n log n)`
+
+overall.
+
+## Final reference sheet
+
+| Concept | Typical complexity |
+|---|---:|
+| Constant operation | `O(1)` |
+| Binary search | `O(log n)` |
+| Linear search | `O(n)` |
+| Efficient comparison sorting | `O(n log n)` |
+| Quadratic sorting | `O(n²)` |
+| Exponential algorithm | `O(2ⁿ)` |
+| Factorial algorithm | `O(n!)` |
+| Hash-table lookup average | `O(1)` |
+| Hash-table lookup worst case | `O(n)` |
+| Dynamic-array append amortized | `O(1)` |
+| Array indexed access | `O(1)` |
+| Linked-list indexed access | `O(n)` |
+
+## Core lessons
+
+- Complexity describes how resource usage scales with input size.
+- Time complexity measures computational work.
+- Space complexity measures additional memory requirements.
+- Best case describes the most favorable input.
+- Average case describes expected behavior under an input distribution.
+- Worst case describes the maximum work for inputs of a given size.
+- Big O is used to describe asymptotic growth.
+- Constant factors and lower-order terms are normally ignored in asymptotic classification.
+- Linear search has `O(n)` average and worst-case complexity.
+- Binary search has `O(log n)` average and worst-case complexity when its requirements are satisfied.
+- Binary search requires sorted data and suitable access to the search space.
+- Bubble sort, selection sort, and insertion sort can have `O(n²)` average or worst-case behavior.
+- Merge sort provides `O(n log n)` worst-case performance.
+- Quicksort has `O(n log n)` average complexity but can reach `O(n²)` in the worst case.
+- Hash tables provide expected `O(1)` lookup under suitable assumptions.
+- Hash-table operations can degrade to `O(n)` in the worst case.
+- Array indexing is typically `O(1)`.
+- Linked-list indexed access is `O(n)`.
+- Dynamic-array append is `O(1)` amortized.
+- Amortized analysis is different from average-case analysis.
+- Repeated searches can justify preprocessing through sorting or indexing.
+- Edge cases and input characteristics can affect actual behavior.
+- Worst-case complexity should be considered when handling untrusted input.
+- Asymptotic complexity is an important tool, but real performance also depends on implementation, hardware, memory behavior, and workload.
