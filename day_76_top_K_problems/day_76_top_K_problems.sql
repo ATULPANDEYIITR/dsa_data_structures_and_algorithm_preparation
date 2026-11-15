@@ -1,399 +1,660 @@
-import java.util.*;
-import java.util.function.Function;
-import java.util.stream.Collectors;
+-- ============================================================
+-- TOP-K SELECTION AND ANALYTICS DATABASE
+-- PostgreSQL 15+
+--
+-- Covers:
+--   1. Kth largest and smallest
+--   2. Top-K frequent values
+--   3. K closest values
+--   4. Ranking and tie-breaking
+--   5. Dataset management
+--   6. Request validation and execution auditing
+-- ============================================================
 
-/**
- * Top-K Selection and Enterprise Ranking Engine.
- *
- * Java 17, standard library only.
- *
- * Features:
- * - Kth largest and smallest
- * - Top-K frequent elements
- * - K closest elements
- * - Quickselect
- * - Immutable request and response records
- * - Policy-driven service layer
- * - Validation and typed exceptions
- * - Enterprise-style batch processing
- */
-public class TopKEnterprise {
+BEGIN;
 
-    enum Operation {
-        KTH_LARGEST,
-        KTH_SMALLEST,
-        TOP_K_FREQUENT,
-        K_CLOSEST
-    }
+CREATE SCHEMA IF NOT EXISTS topk;
 
-    record SelectionRequest(
-        Operation operation,
-        List<Integer> values,
-        int k,
-        Integer target
-    ) {
-        SelectionRequest {
-            Objects.requireNonNull(operation, "Operation is required");
-            Objects.requireNonNull(values, "Values are required");
+CREATE TABLE IF NOT EXISTS topk.datasets (
+    dataset_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dataset_name VARCHAR(120) NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-            values = List.copyOf(values);
+CREATE TABLE IF NOT EXISTS topk.dataset_values (
+    value_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dataset_id BIGINT NOT NULL
+        REFERENCES topk.datasets(dataset_id)
+        ON DELETE CASCADE,
+    value INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (dataset_id, position)
+);
 
-            if (values.stream().anyMatch(Objects::isNull)) {
-                throw new ValidationException("Null elements are prohibited");
-            }
+CREATE INDEX IF NOT EXISTS idx_dataset_values_dataset_value
+    ON topk.dataset_values(dataset_id, value);
 
-            if (operation == Operation.K_CLOSEST && target == null) {
-                throw new ValidationException("Target is required");
-            }
-        }
-    }
+CREATE INDEX IF NOT EXISTS idx_dataset_values_dataset_position
+    ON topk.dataset_values(dataset_id, position);
 
-    record SelectionResponse(
-        Operation operation,
-        List<Integer> result,
-        long executionTimeNanos
-    ) {
-        SelectionResponse {
-            result = List.copyOf(result);
-        }
-    }
+CREATE TABLE IF NOT EXISTS topk.selection_requests (
+    request_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dataset_id BIGINT NOT NULL
+        REFERENCES topk.datasets(dataset_id),
+    operation VARCHAR(30) NOT NULL
+        CHECK (operation IN (
+            'KTH_LARGEST',
+            'KTH_SMALLEST',
+            'TOP_K_FREQUENT',
+            'K_CLOSEST'
+        )),
+    k INTEGER NOT NULL CHECK (k >= 0),
+    target_value INTEGER,
+    request_status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+        CHECK (request_status IN (
+            'PENDING',
+            'RUNNING',
+            'COMPLETED',
+            'FAILED'
+        )),
+    result_values INTEGER[],
+    error_message TEXT,
+    execution_time_ms NUMERIC(14, 4),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
 
-    record FrequencyEntry(int value, int frequency) {}
+    CHECK (
+        (operation = 'K_CLOSEST' AND target_value IS NOT NULL)
+        OR
+        (operation <> 'K_CLOSEST' AND target_value IS NULL)
+    ),
 
-    static class ValidationException extends IllegalArgumentException {
-        ValidationException(String message) {
-            super(message);
-        }
-    }
+    CHECK (
+        request_status <> 'COMPLETED'
+        OR completed_at IS NOT NULL
+    )
+);
 
-    static class SelectionService {
+CREATE INDEX IF NOT EXISTS idx_selection_requests_status
+    ON topk.selection_requests(request_status, created_at DESC);
 
-        private void validateK(int k, int size, boolean allowZero) {
-            int minimum = allowZero ? 0 : 1;
+CREATE TABLE IF NOT EXISTS topk.selection_audit (
+    audit_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    request_id BIGINT NOT NULL
+        REFERENCES topk.selection_requests(request_id)
+        ON DELETE CASCADE,
+    event_type VARCHAR(30) NOT NULL,
+    event_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-            if (k < minimum || k > size) {
-                throw new ValidationException(
-                    "k must be between " + minimum + " and " + size
-                );
-            }
-        }
+CREATE INDEX IF NOT EXISTS idx_selection_audit_request_time
+    ON topk.selection_audit(request_id, occurred_at DESC);
 
-        public int kthLargest(List<Integer> values, int k) {
-            validateK(k, values.size(), false);
 
-            PriorityQueue<Integer> heap = new PriorityQueue<>();
+-- ------------------------------------------------------------
+-- Dataset creation and sample values
+-- ------------------------------------------------------------
 
-            for (int value : values) {
-                heap.offer(value);
+INSERT INTO topk.datasets (dataset_name, description)
+VALUES
+    ('basic_selection', 'General integer selection dataset'),
+    ('frequency_analysis', 'Frequency ranking dataset'),
+    ('closest_analysis', 'Sorted values for proximity selection'),
+    ('duplicate_analysis', 'Duplicate-heavy selection dataset')
+ON CONFLICT (dataset_name) DO NOTHING;
 
-                if (heap.size() > k) {
-                    heap.poll();
-                }
-            }
 
-            return heap.element();
-        }
+INSERT INTO topk.dataset_values (dataset_id, value, position)
+SELECT d.dataset_id, v.value, v.position
+FROM topk.datasets d
+JOIN (
+    VALUES
+        ('basic_selection', 3, 0),
+        ('basic_selection', 2, 1),
+        ('basic_selection', 1, 2),
+        ('basic_selection', 5, 3),
+        ('basic_selection', 6, 4),
+        ('basic_selection', 4, 5),
 
-        public int kthSmallest(List<Integer> values, int k) {
-            validateK(k, values.size(), false);
+        ('frequency_analysis', 1, 0),
+        ('frequency_analysis', 1, 1),
+        ('frequency_analysis', 1, 2),
+        ('frequency_analysis', 2, 3),
+        ('frequency_analysis', 2, 4),
+        ('frequency_analysis', 3, 5),
+        ('frequency_analysis', 4, 6),
+        ('frequency_analysis', 4, 7),
+        ('frequency_analysis', 4, 8),
+        ('frequency_analysis', 4, 9),
 
-            PriorityQueue<Integer> heap =
-                new PriorityQueue<>(Comparator.reverseOrder());
+        ('closest_analysis', 1, 0),
+        ('closest_analysis', 2, 1),
+        ('closest_analysis', 3, 2),
+        ('closest_analysis', 4, 3),
+        ('closest_analysis', 5, 4),
 
-            for (int value : values) {
-                heap.offer(value);
+        ('duplicate_analysis', 5, 0),
+        ('duplicate_analysis', 5, 1),
+        ('duplicate_analysis', 5, 2),
+        ('duplicate_analysis', 2, 3),
+        ('duplicate_analysis', 2, 4),
+        ('duplicate_analysis', 8, 5)
+) AS v(dataset_name, value, position)
+ON v.dataset_name = d.dataset_name
+ON CONFLICT (dataset_id, position) DO NOTHING;
 
-                if (heap.size() > k) {
-                    heap.poll();
-                }
-            }
 
-            return heap.element();
-        }
+-- ------------------------------------------------------------
+-- Validation helper
+-- ------------------------------------------------------------
 
-        public int quickselectLargest(List<Integer> values, int k) {
-            validateK(k, values.size(), false);
+CREATE OR REPLACE FUNCTION topk.validate_selection_request(
+    p_dataset_id BIGINT,
+    p_operation VARCHAR,
+    p_k INTEGER,
+    p_target INTEGER DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_distinct_count INTEGER;
+    v_is_sorted BOOLEAN;
+BEGIN
+    SELECT
+        COUNT(*),
+        COUNT(DISTINCT value)
+    INTO v_count, v_distinct_count
+    FROM topk.dataset_values
+    WHERE dataset_id = p_dataset_id;
 
-            int[] array = values.stream()
-                .mapToInt(Integer::intValue)
-                .toArray();
+    IF NOT FOUND OR v_count = 0 THEN
+        RAISE EXCEPTION 'Dataset is empty or unavailable';
+    END IF;
 
-            int target = k - 1;
-            int left = 0;
-            int right = array.length - 1;
+    IF p_operation NOT IN (
+        'KTH_LARGEST',
+        'KTH_SMALLEST',
+        'TOP_K_FREQUENT',
+        'K_CLOSEST'
+    ) THEN
+        RAISE EXCEPTION 'Unsupported operation: %', p_operation;
+    END IF;
 
-            Random random = new Random();
+    IF p_k < 0 THEN
+        RAISE EXCEPTION 'k cannot be negative';
+    END IF;
 
-            while (left <= right) {
-                int pivot = array[
-                    left + random.nextInt(right - left + 1)
-                ];
+    IF p_operation IN ('KTH_LARGEST', 'KTH_SMALLEST')
+       AND p_k NOT BETWEEN 1 AND v_count THEN
+        RAISE EXCEPTION 'k must be between 1 and %', v_count;
+    END IF;
 
-                int low = left;
-                int current = left;
-                int high = right;
+    IF p_operation = 'TOP_K_FREQUENT'
+       AND p_k > v_distinct_count THEN
+        RAISE EXCEPTION 'k exceeds distinct value count';
+    END IF;
 
-                while (current <= high) {
-                    if (array[current] > pivot) {
-                        int temp = array[current];
-                        array[current] = array[low];
-                        array[low] = temp;
-                        current++;
-                        low++;
-                    } else if (array[current] < pivot) {
-                        int temp = array[current];
-                        array[current] = array[high];
-                        array[high] = temp;
-                        high--;
-                    } else {
-                        current++;
-                    }
-                }
+    IF p_operation = 'K_CLOSEST' THEN
+        IF p_k > v_count THEN
+            RAISE EXCEPTION 'k exceeds dataset size';
+        END IF;
 
-                if (target < low) {
-                    right = low - 1;
-                } else if (target > high) {
-                    left = high + 1;
-                } else {
-                    return array[target];
-                }
-            }
+        IF p_target IS NULL THEN
+            RAISE EXCEPTION 'Target is required';
+        END IF;
 
-            throw new IllegalStateException("Quickselect failed");
-        }
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM topk.dataset_values a
+            JOIN topk.dataset_values b
+              ON b.dataset_id = a.dataset_id
+             AND b.position = a.position + 1
+            WHERE a.dataset_id = p_dataset_id
+              AND a.value > b.value
+        )
+        INTO v_is_sorted;
 
-        public List<Integer> topKFrequent(
-            List<Integer> values,
-            int k
-        ) {
-            Map<Integer, Long> frequencies = values.stream()
-                .collect(Collectors.groupingBy(
-                    Function.identity(),
-                    Collectors.counting()
-                ));
+        IF NOT v_is_sorted THEN
+            RAISE EXCEPTION 'K_CLOSEST requires sorted input';
+        END IF;
+    END IF;
 
-            validateK(k, frequencies.size(), true);
+    RETURN TRUE;
+END;
+$$;
 
-            Comparator<FrequencyEntry> ordering =
-                Comparator.comparingInt(FrequencyEntry::frequency)
-                    .thenComparing(
-                        Comparator.comparingInt(FrequencyEntry::value)
-                            .reversed()
-                    );
 
-            PriorityQueue<FrequencyEntry> heap =
-                new PriorityQueue<>(ordering);
+-- ------------------------------------------------------------
+-- Selection execution function
+-- ------------------------------------------------------------
 
-            frequencies.forEach((value, count) -> {
-                heap.offer(new FrequencyEntry(
-                    value,
-                    Math.toIntExact(count)
-                ));
+CREATE OR REPLACE FUNCTION topk.execute_selection(
+    p_dataset_id BIGINT,
+    p_operation VARCHAR,
+    p_k INTEGER,
+    p_target INTEGER DEFAULT NULL
+)
+RETURNS INTEGER[]
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result INTEGER[];
+BEGIN
+    PERFORM topk.validate_selection_request(
+        p_dataset_id,
+        p_operation,
+        p_k,
+        p_target
+    );
 
-                if (heap.size() > k) {
-                    heap.poll();
-                }
-            });
+    IF p_operation = 'KTH_LARGEST' THEN
+        SELECT ARRAY_AGG(value ORDER BY value DESC)
+        INTO v_result
+        FROM (
+            SELECT value
+            FROM topk.dataset_values
+            WHERE dataset_id = p_dataset_id
+            ORDER BY value DESC
+            OFFSET p_k - 1
+            LIMIT 1
+        ) selected;
 
-            List<Integer> result = new ArrayList<>();
+    ELSIF p_operation = 'KTH_SMALLEST' THEN
+        SELECT ARRAY_AGG(value ORDER BY value)
+        INTO v_result
+        FROM (
+            SELECT value
+            FROM topk.dataset_values
+            WHERE dataset_id = p_dataset_id
+            ORDER BY value
+            OFFSET p_k - 1
+            LIMIT 1
+        ) selected;
 
-            while (!heap.isEmpty()) {
-                result.add(heap.poll().value());
-            }
+    ELSIF p_operation = 'TOP_K_FREQUENT' THEN
+        WITH frequencies AS (
+            SELECT
+                value,
+                COUNT(*) AS frequency
+            FROM topk.dataset_values
+            WHERE dataset_id = p_dataset_id
+            GROUP BY value
+        ),
+        ranked AS (
+            SELECT
+                value,
+                frequency,
+                ROW_NUMBER() OVER (
+                    ORDER BY frequency DESC, value ASC
+                ) AS ranking
+            FROM frequencies
+        )
+        SELECT COALESCE(
+            ARRAY_AGG(value ORDER BY ranking),
+            ARRAY[]::INTEGER[]
+        )
+        INTO v_result
+        FROM ranked
+        WHERE ranking <= p_k;
 
-            result.sort((a, b) -> {
-                int comparison = Long.compare(
-                    frequencies.get(b),
-                    frequencies.get(a)
-                );
+    ELSIF p_operation = 'K_CLOSEST' THEN
+        SELECT COALESCE(
+            ARRAY_AGG(value ORDER BY value),
+            ARRAY[]::INTEGER[]
+        )
+        INTO v_result
+        FROM (
+            SELECT value
+            FROM topk.dataset_values
+            WHERE dataset_id = p_dataset_id
+            ORDER BY ABS(value::BIGINT - p_target), value
+            LIMIT p_k
+        ) selected;
 
-                return comparison != 0
-                    ? comparison
-                    : Integer.compare(a, b);
-            });
+    END IF;
 
-            return List.copyOf(result);
-        }
+    RETURN COALESCE(v_result, ARRAY[]::INTEGER[]);
+END;
+$$;
 
-        public List<Integer> kClosestElements(
-            List<Integer> values,
-            int k,
-            int target
-        ) {
-            validateK(k, values.size(), true);
 
-            for (int i = 1; i < values.size(); i++) {
-                if (values.get(i - 1) > values.get(i)) {
-                    throw new ValidationException(
-                        "Input must be sorted"
-                    );
-                }
-            }
+-- ------------------------------------------------------------
+-- Request creation procedure
+-- ------------------------------------------------------------
 
-            if (k == 0) {
-                return List.of();
-            }
+CREATE OR REPLACE PROCEDURE topk.submit_selection_request(
+    p_dataset_id BIGINT,
+    p_operation VARCHAR,
+    p_k INTEGER,
+    p_target INTEGER DEFAULT NULL
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_request_id BIGINT;
+    v_started TIMESTAMPTZ;
+    v_result INTEGER[];
+BEGIN
+    PERFORM topk.validate_selection_request(
+        p_dataset_id,
+        p_operation,
+        p_k,
+        p_target
+    );
 
-            int left = 0;
-            int right = values.size() - k;
+    INSERT INTO topk.selection_requests (
+        dataset_id,
+        operation,
+        k,
+        target_value,
+        request_status
+    )
+    VALUES (
+        p_dataset_id,
+        p_operation,
+        p_k,
+        p_target,
+        'RUNNING'
+    )
+    RETURNING request_id INTO v_request_id;
 
-            while (left < right) {
-                int middle = left + (right - left) / 2;
+    v_started := clock_timestamp();
 
-                long leftDistance =
-                    (long) target - values.get(middle);
+    INSERT INTO topk.selection_audit (
+        request_id,
+        event_type,
+        event_details
+    )
+    VALUES (
+        v_request_id,
+        'REQUEST_STARTED',
+        jsonb_build_object(
+            'operation', p_operation,
+            'k', p_k
+        )
+    );
 
-                long rightDistance =
-                    (long) values.get(middle + k) - target;
+    v_result := topk.execute_selection(
+        p_dataset_id,
+        p_operation,
+        p_k,
+        p_target
+    );
 
-                if (leftDistance > rightDistance) {
-                    left = middle + 1;
-                } else {
-                    right = middle;
-                }
-            }
+    UPDATE topk.selection_requests
+    SET
+        request_status = 'COMPLETED',
+        result_values = v_result,
+        execution_time_ms =
+            EXTRACT(EPOCH FROM clock_timestamp() - v_started) * 1000,
+        completed_at = clock_timestamp()
+    WHERE request_id = v_request_id;
 
-            return List.copyOf(
-                values.subList(left, left + k)
+    INSERT INTO topk.selection_audit (
+        request_id,
+        event_type,
+        event_details
+    )
+    VALUES (
+        v_request_id,
+        'REQUEST_COMPLETED',
+        jsonb_build_object('result', v_result)
+    );
+
+EXCEPTION
+    WHEN OTHERS THEN
+        IF v_request_id IS NOT NULL THEN
+            UPDATE topk.selection_requests
+            SET
+                request_status = 'FAILED',
+                error_message = SQLERRM,
+                completed_at = clock_timestamp()
+            WHERE request_id = v_request_id;
+
+            INSERT INTO topk.selection_audit (
+                request_id,
+                event_type,
+                event_details
+            )
+            VALUES (
+                v_request_id,
+                'REQUEST_FAILED',
+                jsonb_build_object('error', SQLERRM)
             );
-        }
+        END IF;
 
-        public SelectionResponse execute(SelectionRequest request) {
-            Objects.requireNonNull(request);
+        RAISE;
+END;
+$$;
 
-            long start = System.nanoTime();
 
-            List<Integer> result = switch (request.operation()) {
-                case KTH_LARGEST -> List.of(
-                    kthLargest(request.values(), request.k())
-                );
+-- ------------------------------------------------------------
+-- Reporting view
+-- ------------------------------------------------------------
 
-                case KTH_SMALLEST -> List.of(
-                    kthSmallest(request.values(), request.k())
-                );
+CREATE OR REPLACE VIEW topk.selection_report AS
+SELECT
+    r.request_id,
+    d.dataset_name,
+    r.operation,
+    r.k,
+    r.target_value,
+    r.request_status,
+    r.result_values,
+    r.error_message,
+    r.execution_time_ms,
+    r.created_at,
+    r.completed_at
+FROM topk.selection_requests r
+JOIN topk.datasets d
+    ON d.dataset_id = r.dataset_id;
 
-                case TOP_K_FREQUENT -> topKFrequent(
-                    request.values(),
-                    request.k()
-                );
 
-                case K_CLOSEST -> kClosestElements(
-                    request.values(),
-                    request.k(),
-                    request.target()
-                );
-            };
+-- ------------------------------------------------------------
+-- Sample request execution
+-- ------------------------------------------------------------
 
-            return new SelectionResponse(
-                request.operation(),
-                result,
-                System.nanoTime() - start
-            );
-        }
+DO $$
+DECLARE
+    v_basic BIGINT;
+    v_frequency BIGINT;
+    v_closest BIGINT;
+    v_duplicate BIGINT;
+BEGIN
+    SELECT dataset_id INTO v_basic
+    FROM topk.datasets
+    WHERE dataset_name = 'basic_selection';
 
-        public List<SelectionResponse> executeBatch(
-            List<SelectionRequest> requests
-        ) {
-            return requests.stream()
-                .map(this::execute)
-                .toList();
-        }
-    }
+    SELECT dataset_id INTO v_frequency
+    FROM topk.datasets
+    WHERE dataset_name = 'frequency_analysis';
 
-    private static void runTests(SelectionService service) {
-        List<Integer> values = List.of(3, 2, 1, 5, 6, 4);
+    SELECT dataset_id INTO v_closest
+    FROM topk.datasets
+    WHERE dataset_name = 'closest_analysis';
 
-        assert service.kthLargest(values, 2) == 5;
-        assert service.kthSmallest(values, 2) == 2;
-        assert service.quickselectLargest(values, 2) == 5;
+    SELECT dataset_id INTO v_duplicate
+    FROM topk.datasets
+    WHERE dataset_name = 'duplicate_analysis';
 
-        assert service.topKFrequent(
-            List.of(1, 1, 1, 2, 2, 3),
-            2
-        ).equals(List.of(1, 2));
+    CALL topk.submit_selection_request(
+        v_basic, 'KTH_LARGEST', 2
+    );
 
-        assert service.kClosestElements(
-            List.of(1, 2, 3, 4, 5),
-            4,
-            3
-        ).equals(List.of(1, 2, 3, 4));
+    CALL topk.submit_selection_request(
+        v_basic, 'KTH_SMALLEST', 3
+    );
 
-        assert service.topKFrequent(List.of(), 0).isEmpty();
+    CALL topk.submit_selection_request(
+        v_frequency, 'TOP_K_FREQUENT', 2
+    );
 
-        boolean rejected = false;
+    CALL topk.submit_selection_request(
+        v_closest, 'K_CLOSEST', 4, 3
+    );
 
-        try {
-            service.kthLargest(values, 10);
-        } catch (ValidationException exception) {
-            rejected = true;
-        }
+    CALL topk.submit_selection_request(
+        v_duplicate, 'KTH_LARGEST', 3
+    );
+END;
+$$;
 
-        assert rejected;
-    }
 
-    public static void main(String[] args) {
-        SelectionService service = new SelectionService();
+-- ------------------------------------------------------------
+-- Retrieval query
+-- ------------------------------------------------------------
 
-        System.out.println("TOP-K ENTERPRISE SELECTION ENGINE");
-        System.out.println("=================================");
+SELECT
+    dataset_name,
+    value,
+    position
+FROM topk.dataset_values v
+JOIN topk.datasets d USING (dataset_id)
+WHERE d.dataset_name = 'basic_selection'
+ORDER BY position;
 
-        List<Integer> values = List.of(3, 2, 1, 5, 6, 4);
 
-        System.out.println(
-            "Second largest: " + service.kthLargest(values, 2)
-        );
+-- ------------------------------------------------------------
+-- Validation query: detect duplicate values
+-- ------------------------------------------------------------
 
-        System.out.println(
-            "Third smallest: " + service.kthSmallest(values, 3)
-        );
+SELECT
+    d.dataset_name,
+    v.value,
+    COUNT(*) AS occurrences
+FROM topk.dataset_values v
+JOIN topk.datasets d USING (dataset_id)
+GROUP BY d.dataset_name, v.value
+HAVING COUNT(*) > 1
+ORDER BY d.dataset_name, occurrences DESC;
 
-        System.out.println(
-            "Quickselect: " + service.quickselectLargest(values, 2)
-        );
 
-        System.out.println(
-            "Top frequent: " +
-            service.topKFrequent(
-                List.of(1, 1, 1, 2, 2, 3),
-                2
-            )
-        );
+-- ------------------------------------------------------------
+-- Ranking query: top frequent values
+-- ------------------------------------------------------------
 
-        System.out.println(
-            "Closest: " +
-            service.kClosestElements(
-                List.of(1, 2, 3, 4, 5),
-                4,
-                3
-            )
-        );
+WITH frequency_data AS (
+    SELECT
+        value,
+        COUNT(*) AS frequency
+    FROM topk.dataset_values
+    WHERE dataset_id = (
+        SELECT dataset_id
+        FROM topk.datasets
+        WHERE dataset_name = 'frequency_analysis'
+    )
+    GROUP BY value
+),
+ranked_values AS (
+    SELECT
+        value,
+        frequency,
+        DENSE_RANK() OVER (
+            ORDER BY frequency DESC
+        ) AS frequency_rank
+    FROM frequency_data
+)
+SELECT *
+FROM ranked_values
+WHERE frequency_rank <= 2
+ORDER BY frequency_rank, value;
 
-        List<SelectionRequest> requests = List.of(
-            new SelectionRequest(
-                Operation.KTH_LARGEST, values, 2, null
-            ),
-            new SelectionRequest(
-                Operation.TOP_K_FREQUENT,
-                List.of(4, 4, 3, 3, 2),
-                2,
-                null
-            ),
-            new SelectionRequest(
-                Operation.K_CLOSEST,
-                List.of(1, 2, 3, 4, 5),
-                2,
-                4
-            )
-        );
 
-        System.out.println("\nEnterprise batch processing:");
+-- ------------------------------------------------------------
+-- Aggregation query
+-- ------------------------------------------------------------
 
-        for (SelectionResponse response : service.executeBatch(requests)) {
-            System.out.println(response);
-        }
+SELECT
+    d.dataset_name,
+    COUNT(*) AS total_values,
+    COUNT(DISTINCT v.value) AS distinct_values,
+    MIN(v.value) AS minimum_value,
+    MAX(v.value) AS maximum_value,
+    AVG(v.value)::NUMERIC(12, 2) AS average_value
+FROM topk.datasets d
+JOIN topk.dataset_values v USING (dataset_id)
+GROUP BY d.dataset_name
+ORDER BY d.dataset_name;
 
-        runTests(service);
 
-        System.out.println("\nAll assertions passed.");
-    }
-}
+-- ------------------------------------------------------------
+-- Eligibility evaluation
+-- ------------------------------------------------------------
+
+SELECT
+    r.request_id,
+    r.operation,
+    r.k,
+    CASE
+        WHEN r.operation IN ('KTH_LARGEST', 'KTH_SMALLEST')
+             AND r.k BETWEEN 1 AND counts.total_count
+            THEN TRUE
+        WHEN r.operation = 'TOP_K_FREQUENT'
+             AND r.k <= counts.distinct_count
+            THEN TRUE
+        WHEN r.operation = 'K_CLOSEST'
+             AND r.k <= counts.total_count
+             AND r.target_value IS NOT NULL
+            THEN TRUE
+        ELSE FALSE
+    END AS structurally_eligible
+FROM topk.selection_requests r
+CROSS JOIN LATERAL (
+    SELECT
+        COUNT(*) AS total_count,
+        COUNT(DISTINCT value) AS distinct_count
+    FROM topk.dataset_values v
+    WHERE v.dataset_id = r.dataset_id
+) counts;
+
+
+-- ------------------------------------------------------------
+-- Execution report
+-- ------------------------------------------------------------
+
+SELECT
+    operation,
+    request_status,
+    COUNT(*) AS request_count,
+    ROUND(AVG(execution_time_ms), 4) AS average_ms
+FROM topk.selection_requests
+GROUP BY operation, request_status
+ORDER BY operation, request_status;
+
+
+-- ------------------------------------------------------------
+-- Audit retrieval
+-- ------------------------------------------------------------
+
+SELECT
+    a.audit_id,
+    a.request_id,
+    a.event_type,
+    a.event_details,
+    a.occurred_at
+FROM topk.selection_audit a
+ORDER BY a.occurred_at DESC;
+
+
+COMMIT;
+
+-- ============================================================
+-- Operational notes:
+--
+-- 1. Ranking queries use SQL sorting and window functions.
+-- 2. PostgreSQL does not automatically turn ORDER BY LIMIT
+--    into a bounded application-level heap.
+-- 3. For repeated high-volume requests, indexes, statistics,
+--    dataset cardinality, and query plans must be evaluated.
+-- 4. ABS(value::BIGINT - target) avoids integer subtraction
+--    overflow for INTEGER input values.
+-- 5. Failed procedure calls roll back their statement-level
+--    effects when the exception is re-raised. A caller requiring
+--    durable failure auditing should record failures in a
+--    separate transaction.
+-- ============================================================
